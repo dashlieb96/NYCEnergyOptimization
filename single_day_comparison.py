@@ -1,7 +1,22 @@
 """
 Single 24-hour comparison: Heuristic vs Optimized Battery Dispatch
+
+Compares four scenarios:
+1. Grid Only (Baseline) - no PV, no battery
+2. PV Only - solar but no battery storage
+3. PV + Battery (Heuristic) - rule-based dispatch
+4. PV + Battery (Optimized) - CVXPY optimization
+
+Usage:
+    python single_day_comparison.py --help
+    python single_day_comparison.py -f test2.xlsx -d 182
+    python single_day_comparison.py --file data.xlsx --day 0 --demand-rate 0.85
 """
 
+import argparse
+import os
+import platform
+import subprocess
 import numpy as np
 import pandas as pd
 import cvxpy as cp
@@ -13,38 +28,80 @@ def load_single_day(filepath: str = 'test2.xlsx', day_index: int = 182):
     """
     Load a single day of data.
 
+    Handles two data formats:
+    1. Full year data (8736 hours) - slices the requested day
+    2. Daily template (24 hours) - uses directly, ignores day_index for that field
+
     day_index: 0 = Jan 1, 182 = July 1 (approx)
     """
     xlsx = pd.ExcelFile(filepath)
+    available_sheets = xlsx.sheet_names
 
     start_hour = day_index * 24
     end_hour = start_hour + 24
 
-    # Energy prices
-    ep_buy = pd.read_excel(xlsx, sheet_name='ep_b', header=None).iloc[0].astype(float).values[start_hour:end_hour]
-    ep_sell = pd.read_excel(xlsx, sheet_name='ep_s', header=None).iloc[0].astype(float).values[start_hour:end_hour]
+    def load_hourly_data(sheet_name, default_value=0.0):
+        """Load data, handling both 24-hour templates and full-year data."""
+        if sheet_name not in available_sheets:
+            return np.full(24, default_value)
+
+        data = pd.read_excel(xlsx, sheet_name=sheet_name, header=None).iloc[0].astype(float).values
+
+        if len(data) >= end_hour:
+            # Full year data - slice the requested day
+            return data[start_hour:end_hour]
+        elif len(data) == 24:
+            # 24-hour template - use directly
+            return data
+        elif len(data) > 24:
+            # Partial year - try to slice, or use first 24 hours
+            if len(data) >= start_hour + 24:
+                return data[start_hour:end_hour]
+            else:
+                print(f"  Warning: {sheet_name} has {len(data)} values, using first 24 hours")
+                return data[:24]
+        else:
+            # Less than 24 hours - pad with last value
+            print(f"  Warning: {sheet_name} has only {len(data)} values, padding to 24")
+            padded = np.full(24, data[-1] if len(data) > 0 else default_value)
+            padded[:len(data)] = data
+            return padded
+
+    # Energy buy prices (required)
+    ep_buy = load_hourly_data('ep_b', default_value=0.20)
+
+    # Energy sell prices (optional - not used in NYC mode)
+    ep_sell = load_hourly_data('ep_s', default_value=0.0)
 
     # PV generation
-    pv = pd.read_excel(xlsx, sheet_name='rg', header=None).iloc[0].astype(float).values[start_hour:end_hour]
+    pv = load_hourly_data('rg', default_value=0.0)
 
-    # Building demand - from 'ed' sheet (24-hour template)
-    # NOTE: This is synthetic test data, not real metered demand
-    ed_template = pd.read_excel(xlsx, sheet_name='ed', header=None).iloc[0].astype(float).values
-    demand = ed_template[:24]  # Use the 24-hour template
+    # Building demand
+    demand = load_hourly_data('ed', default_value=0.0)
 
-    # Replace any NaN with interpolation
-    demand = np.nan_to_num(demand, nan=np.nanmean(demand))
+    # Replace any NaN with mean
+    demand = np.nan_to_num(demand, nan=np.nanmean(demand[~np.isnan(demand)]) if np.any(~np.isnan(demand)) else 0)
+    pv = np.nan_to_num(pv, nan=0.0)
+    ep_buy = np.nan_to_num(ep_buy, nan=np.nanmean(ep_buy[~np.isnan(ep_buy)]) if np.any(~np.isnan(ep_buy)) else 0.20)
 
-    # Battery parameters
+    # Battery parameters - try to read from file, else use defaults
+    def read_param(sheet_name, default):
+        if sheet_name in available_sheets:
+            try:
+                return float(pd.read_excel(xlsx, sheet_name=sheet_name, header=None).iloc[0, 0])
+            except:
+                return default
+        return default
+
     battery = {
-        'capacity': 1200,       # kWh
-        'min_soc': 120,         # kWh
-        'max_soc': 1200,        # kWh
-        'max_charge': 300,      # kW
-        'max_discharge': 300,   # kW
-        'eff_charge': 0.9,
-        'eff_discharge': 0.9,
-        'initial_soc': 600,     # kWh
+        'capacity': read_param('emax', 1200),
+        'min_soc': read_param('emin', 120),
+        'max_soc': read_param('emax', 1200),
+        'max_charge': read_param('pch', 300),
+        'max_discharge': read_param('pdis', 300),
+        'eff_charge': read_param('nch', 0.9),
+        'eff_discharge': read_param('ndis', 0.9),
+        'initial_soc': read_param('einit', 600),
     }
 
     return {
@@ -282,7 +339,7 @@ def optimized_dispatch(data, demand_charge_rate=0.85, allow_export=False):
     }
 
 
-def plot_single_day(data, heuristic, optimized):
+def plot_single_day(data, heuristic, optimized, save_path: str = 'single_day_comparison.png'):
     """Create detailed single-day comparison plot."""
 
     hours = data['hours']
@@ -425,10 +482,10 @@ def plot_single_day(data, heuristic, optimized):
     ax6.set_xlim(-0.5, 23.5)
 
     plt.tight_layout()
-    plt.savefig('single_day_comparison.png', dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-    print("Plot saved to: single_day_comparison.png")
+    print(f"Plot saved to: {save_path}")
 
 
 def calculate_costs(grid_buy, grid_sell, price_buy, price_sell, demand_rate=0.85,
@@ -461,16 +518,55 @@ def calculate_costs(grid_buy, grid_sell, price_buy, price_sell, demand_rate=0.85
     }
 
 
-def main():
+def open_figures(filepaths: list):
+    """Open generated figures using the system default viewer."""
+    system = platform.system()
+
+    for filepath in filepaths:
+        if not os.path.exists(filepath):
+            print(f"  Warning: {filepath} not found, skipping")
+            continue
+
+        try:
+            if system == 'Darwin':  # macOS
+                subprocess.run(['open', filepath], check=True)
+            elif system == 'Windows':
+                os.startfile(filepath)
+            else:  # Linux
+                subprocess.run(['xdg-open', filepath], check=True)
+            print(f"  Opened: {filepath}")
+        except Exception as e:
+            print(f"  Could not open {filepath}: {e}")
+
+
+def main(filepath: str = 'test2.xlsx',
+         day_index: int = 182,
+         demand_charge_rate: float = 0.85,
+         allow_export: bool = False,
+         output_prefix: str = None):
+    """
+    Run single-day battery dispatch comparison.
+
+    Args:
+        filepath: Path to Excel file with energy data
+        day_index: Day of year to analyze (0=Jan 1, 182=July 1)
+        demand_charge_rate: $/kW daily demand charge rate
+        allow_export: Whether grid export is allowed (False for NYC)
+        output_prefix: Prefix for output files (default: auto-generated)
+    """
     print("=" * 70)
     print("SINGLE DAY ANALYSIS: HEURISTIC vs OPTIMIZED DISPATCH")
     print("=" * 70)
-    print("\n*** NYC MODE: No grid export allowed (excess PV is curtailed) ***")
 
-    # Load a summer day (July 1 = day 182)
-    data = load_single_day('test2.xlsx', day_index=182)
+    if allow_export:
+        print("\n*** EXPORT MODE: Grid export allowed ***")
+    else:
+        print("\n*** NYC MODE: No grid export allowed (excess PV is curtailed) ***")
 
-    print(f"\nDate: {data['date'].strftime('%Y-%m-%d')} (Day 182)")
+    # Load data
+    data = load_single_day(filepath, day_index=day_index)
+
+    print(f"\nDate: {data['date'].strftime('%Y-%m-%d')} (Day {day_index})")
     print(f"\nINPUT DATA:")
     print(f"  Building Demand: {data['demand'].min():.0f} - {data['demand'].max():.0f} kW")
     print(f"  PV Generation:   {data['pv'].min():.0f} - {data['pv'].max():.0f} kW")
@@ -480,15 +576,14 @@ def main():
     print(f"  Capacity: {data['battery']['capacity']} kWh")
     print(f"  Max Power: {data['battery']['max_charge']} kW charge/discharge")
 
-    # Run dispatches (NO EXPORT)
-    allow_export = False
+    print(f"\nDEMAND CHARGE RATE: ${demand_charge_rate}/kW/day")
 
     print("\n" + "-" * 70)
     print("Running heuristic dispatch...")
     heuristic = heuristic_dispatch(data, peak_target=None, allow_export=allow_export)
 
     print("Running optimized dispatch...")
-    optimized = optimized_dispatch(data, allow_export=allow_export)
+    optimized = optimized_dispatch(data, demand_charge_rate=demand_charge_rate, allow_export=allow_export)
     print(f"  Optimizer status: {optimized['status']}")
 
     # =====================
@@ -504,7 +599,7 @@ def main():
         'energy_sell': 0,
         'net_energy': np.sum(data['price_buy'] * baseline_buy),
         'peak_demand': baseline_peak,
-        'demand_charge': 0.85 * baseline_peak,
+        'demand_charge': demand_charge_rate * baseline_peak,
         'curtailed_kwh': 0,
         'pv_used_kwh': 0,
     }
@@ -517,14 +612,14 @@ def main():
 
     costs_pv_only = calculate_costs(
         pv_only_buy, None, data['price_buy'], data['price_sell'],
-        curtailed=pv_only_curtailed, allow_export=False
+        demand_rate=demand_charge_rate, curtailed=pv_only_curtailed, allow_export=allow_export
     )
     costs_pv_only['pv_used_kwh'] = np.sum(pv_used_no_batt)
 
     # 3. PV + BATTERY (Heuristic)
     costs_heur = calculate_costs(
         heuristic['grid_buy'], None, data['price_buy'], data['price_sell'],
-        curtailed=heuristic.get('curtailed'), allow_export=False
+        demand_rate=demand_charge_rate, curtailed=heuristic.get('curtailed'), allow_export=allow_export
     )
     # PV used = total PV - curtailed
     costs_heur['pv_used_kwh'] = np.sum(data['pv']) - costs_heur['curtailed_kwh']
@@ -532,7 +627,7 @@ def main():
     # 4. PV + BATTERY (Optimized)
     costs_opt = calculate_costs(
         optimized['grid_buy'], None, data['price_buy'], data['price_sell'],
-        curtailed=optimized.get('curtailed'), allow_export=False
+        demand_rate=demand_charge_rate, curtailed=optimized.get('curtailed'), allow_export=allow_export
     )
     costs_opt['pv_used_kwh'] = np.sum(data['pv']) - costs_opt['curtailed_kwh']
 
@@ -605,11 +700,31 @@ def main():
     # =====================
     # CREATE COST COMPARISON CHART
     # =====================
-    plot_cost_comparison(data, costs_baseline, costs_pv_only, costs_heur, costs_opt)
+    # Generate output prefix if not provided
+    if output_prefix is None:
+        output_prefix = f"day{day_index}"
+
+    cost_chart_path = f"{output_prefix}_cost_comparison.png"
+    dispatch_chart_path = f"{output_prefix}_dispatch.png"
+
+    plot_cost_comparison(data, costs_baseline, costs_pv_only, costs_heur, costs_opt,
+                         save_path=cost_chart_path)
 
     # Create dispatch plot
-    print("\n" + "-" * 70)
-    plot_single_day(data, heuristic, optimized)
+    plot_single_day(data, heuristic, optimized, save_path=dispatch_chart_path)
+
+    # =====================
+    # PRINT SUMMARY OF GENERATED FILES
+    # =====================
+    print("\n" + "=" * 80)
+    print("GENERATED FILES")
+    print("=" * 80)
+    print(f"  1. {cost_chart_path}")
+    print(f"  2. {dispatch_chart_path}")
+    print("=" * 80)
+
+    # Open the figures automatically
+    open_figures([cost_chart_path, dispatch_chart_path])
 
     return data, heuristic, optimized, {
         'baseline': costs_baseline,
@@ -619,7 +734,8 @@ def main():
     }
 
 
-def plot_cost_comparison(data, costs_baseline, costs_pv_only, costs_heur, costs_opt):
+def plot_cost_comparison(data, costs_baseline, costs_pv_only, costs_heur, costs_opt,
+                         save_path: str = 'cost_comparison.png'):
     """Create a bar chart comparing costs across all scenarios."""
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -725,11 +841,76 @@ def plot_cost_comparison(data, costs_baseline, costs_pv_only, costs_heur, costs_
                  bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
 
     plt.tight_layout()
-    plt.savefig('cost_comparison.png', dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-    print("\nCost comparison chart saved to: cost_comparison.png")
+    print(f"\nCost comparison chart saved to: {save_path}")
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Compare battery dispatch strategies: Heuristic vs Optimized',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -f test2.xlsx -d 182
+  %(prog)s --file data.xlsx --day 0 --demand-rate 0.85
+  %(prog)s -f test2.xlsx -d 182 --allow-export
+  %(prog)s -f test2.xlsx -d 182 -o results/july1
+
+Scenarios compared:
+  1. Grid Only (Baseline) - no PV, no battery
+  2. PV Only - solar but no battery storage
+  3. PV + Battery (Heuristic) - rule-based dispatch
+  4. PV + Battery (Optimized) - CVXPY convex optimization
+        """
+    )
+
+    parser.add_argument(
+        '-f', '--file',
+        type=str,
+        default='test2.xlsx',
+        help='Path to Excel file with energy data (default: test2.xlsx)'
+    )
+
+    parser.add_argument(
+        '-d', '--day',
+        type=int,
+        default=182,
+        help='Day of year to analyze, 0=Jan 1, 182=July 1 (default: 182)'
+    )
+
+    parser.add_argument(
+        '-r', '--demand-rate',
+        type=float,
+        default=0.85,
+        help='Daily demand charge rate in $/kW (default: 0.85)'
+    )
+
+    parser.add_argument(
+        '--allow-export',
+        action='store_true',
+        help='Allow grid export (default: False for NYC)'
+    )
+
+    parser.add_argument(
+        '-o', '--output',
+        type=str,
+        default=None,
+        help='Output prefix for generated files (default: day{N})'
+    )
+
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    results = main()
+    args = parse_args()
+
+    results = main(
+        filepath=args.file,
+        day_index=args.day,
+        demand_charge_rate=args.demand_rate,
+        allow_export=args.allow_export,
+        output_prefix=args.output
+    )
