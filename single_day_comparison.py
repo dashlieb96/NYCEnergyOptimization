@@ -247,7 +247,7 @@ def heuristic_dispatch(data, peak_target=None, allow_export=False):
     }
 
 
-def optimized_dispatch(data, demand_charge_rate=0.85, allow_export=False):
+def optimized_dispatch(data, demand_charge_rate=0.85, allow_export=False, solver='scs'):
     """
     Optimal dispatch using CVXPY.
 
@@ -255,6 +255,7 @@ def optimized_dispatch(data, demand_charge_rate=0.85, allow_export=False):
 
     Args:
         allow_export: If False (default for NYC), no selling back to grid
+        solver: 'highs' for exact LP solver, 'scs' for conic solver (default)
     """
     n = 24
     battery = data['battery']
@@ -295,8 +296,7 @@ def optimized_dispatch(data, demand_charge_rate=0.85, allow_export=False):
         else:
             prev_soc = soc[t-1]
         constraints.append(
-            soc[t] == prev_soc + charge[t] * battery['eff_charge']
-                             - discharge[t] / battery['eff_discharge']
+            soc[t] == prev_soc + charge[t] * battery['eff_charge'] - discharge[t] / battery['eff_discharge']
         )
 
     # SOC limits
@@ -320,12 +320,18 @@ def optimized_dispatch(data, demand_charge_rate=0.85, allow_export=False):
     demand_cost = demand_charge_rate * peak_demand
 
     # Small penalty on curtailment to prefer storing over wasting
+    # We will never curtail so long as PV exceeds demand + available battery storage.
     curtail_penalty = 0.001 * cp.sum(curtailed)
 
     objective = cp.Minimize(energy_cost + demand_cost + curtail_penalty)
 
     problem = cp.Problem(objective, constraints)
-    problem.solve(solver=cp.SCS, verbose=False)
+
+    # Select solver
+    if solver.lower() == 'highs':
+        problem.solve(solver=cp.HIGHS, verbose=False)
+    else:
+        problem.solve(solver=cp.SCS, verbose=False)
 
     return {
         'soc': soc.value,
@@ -539,11 +545,12 @@ def open_figures(filepaths: list):
             print(f"  Could not open {filepath}: {e}")
 
 
-def main(filepath: str = 'test2.xlsx',
+def main(filepath: str = 'testSam.xlsx',
          day_index: int = 182,
          demand_charge_rate: float = 0.85,
          allow_export: bool = False,
-         output_prefix: str = None):
+         output_prefix: str = None,
+         solver: str = 'scs'):
     """
     Run single-day battery dispatch comparison.
 
@@ -553,6 +560,7 @@ def main(filepath: str = 'test2.xlsx',
         demand_charge_rate: $/kW daily demand charge rate
         allow_export: Whether grid export is allowed (False for NYC)
         output_prefix: Prefix for output files (default: auto-generated)
+        solver: Optimization solver - 'highs' or 'scs' (default)
     """
     print("=" * 70)
     print("SINGLE DAY ANALYSIS: HEURISTIC vs OPTIMIZED DISPATCH")
@@ -582,8 +590,8 @@ def main(filepath: str = 'test2.xlsx',
     print("Running heuristic dispatch...")
     heuristic = heuristic_dispatch(data, peak_target=None, allow_export=allow_export)
 
-    print("Running optimized dispatch...")
-    optimized = optimized_dispatch(data, demand_charge_rate=demand_charge_rate, allow_export=allow_export)
+    print(f"Running optimized dispatch (solver={solver})...")
+    optimized = optimized_dispatch(data, demand_charge_rate=demand_charge_rate, allow_export=allow_export, solver=solver)
     print(f"  Optimizer status: {optimized['status']}")
 
     # =====================
@@ -858,12 +866,17 @@ Examples:
   %(prog)s --file data.xlsx --day 0 --demand-rate 0.85
   %(prog)s -f test2.xlsx -d 182 --allow-export
   %(prog)s -f test2.xlsx -d 182 -o results/july1
+  %(prog)s -f test2.xlsx -d 182 -s highs    # Use HiGHS solver
 
 Scenarios compared:
   1. Grid Only (Baseline) - no PV, no battery
   2. PV Only - solar but no battery storage
   3. PV + Battery (Heuristic) - rule-based dispatch
   4. PV + Battery (Optimized) - CVXPY convex optimization
+
+Solvers:
+  scs   - Splitting Conic Solver (default, iterative)
+  highs - HiGHS LP solver (exact, requires: pip install highspy)
         """
     )
 
@@ -901,6 +914,14 @@ Scenarios compared:
         help='Output prefix for generated files (default: day{N})'
     )
 
+    parser.add_argument(
+        '-s', '--solver',
+        type=str,
+        choices=['highs', 'scs'],
+        default='scs',
+        help='Optimization solver: highs (exact LP) or scs (conic, default)'
+    )
+
     return parser.parse_args()
 
 
@@ -912,5 +933,6 @@ if __name__ == "__main__":
         day_index=args.day,
         demand_charge_rate=args.demand_rate,
         allow_export=args.allow_export,
-        output_prefix=args.output
+        output_prefix=args.output,
+        solver=args.solver
     )

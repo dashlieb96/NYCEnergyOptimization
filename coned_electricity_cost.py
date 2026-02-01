@@ -291,7 +291,6 @@ def calculate_daily_electricity_cost(
     timestamps: Union[List[datetime], np.ndarray],
     demands_kw: Union[List[float], np.ndarray],
     interval_minutes: Union[int, List[int], np.ndarray] = 15,
-    service_class: ServiceClass = ServiceClass.SC9,
     rate_type: RateType = RateType.RATE_II,
     rate_schedule: Optional[ConEdRateSchedule] = None,
     standby_schedule: Optional[StandbyRateSchedule] = None,
@@ -316,7 +315,6 @@ def calculate_daily_electricity_cost(
         interval_minutes: Duration of each measurement interval in minutes.
                          Can be a scalar (all same) or array per interval.
                          Con Edison meters typically use 15-minute intervals.
-        service_class: Con Edison service classification (default SC9)
         rate_type: Rate type within service class
         rate_schedule: Custom rate schedule (uses defaults if None)
         standby_schedule: Standby rate schedule (for STANDBY rate type)
